@@ -697,7 +697,7 @@ function defaultCwdHint(): string {
 
 /**
  * [r2] A/B: 统一的"下一步怎么办"提示片段 —— 让每个错误/结果都能自解释, agent 不用猜链路。
- * 抽成常量便于 27 个工具的描述与错误文案保持措辞一致。
+ * 抽成常量便于 28 个工具的描述与错误文案保持措辞一致。
  */
 const HINT = {
   /** 拿到 taskId 之后干什么 */
@@ -724,7 +724,7 @@ function taskNotFoundError(taskId: string): string {
 
 // ═══════════════════ [r3] A: 输出精简/格式化 + C: 错误文案与参数预校验 ═══════════════════
 //
-// R2 已把 27 个工具描述写成"面向 agent"; R3 处理 agent 真正拿到的返回体与错误串:
+// R2 已把 28 个工具描述写成"面向 agent"; R3 处理 agent 真正拿到的返回体与错误串:
 //   A: 时间戳统一 ISO8601(本地时区) + *_at_epoch 保留原始 epoch; 字节/时长带人类可读单位;
 //      列表类返回分页(offset/limit)+ total/truncated; session_log 默认限 50 条并给 truncated 取更多提示。
 //   C: 三类错误(必传参数缺失 / id 不存在 / 会话为空)统一为
@@ -904,7 +904,7 @@ function pageEnvelope<T>(rows: readonly T[], offset: number, limit: number, tool
   }
 }
 
-/** [r3] A: 分页参数 schema(列表类工具共用, 保证 27 个工具的分页口径一致) */
+/** [r3] A: 分页参数 schema(列表类工具共用, 保证 28 个工具的分页口径一致) */
 const pageArgSchema = {
   offset: z.number().int().min(0).optional().describe('跳过前 N 条(默认 0; 配合 limit 翻页)'),
   limit: z.number().int().min(1).max(LIST_PAGE_MAX).optional().describe(`本页最多返回条数(默认 ${LIST_PAGE_DEFAULT}, 最大 ${LIST_PAGE_MAX})`),
@@ -4032,7 +4032,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     return out(JSON.stringify({ 收到: text, ...timeFields('at', now) }))
   })
 
-  mcp.tool('harness_list_tools', '列出 Harness(宿主)自己注册的工具名清单。什么时候用: 想确认某个能力(如 bash/fs/web)在当前部署里是否可用, 或 agent_run 跑的 agent 抱怨没有某个工具时排查用的。返回一个字符串数组(纯名字, 无描述)。注意这是 Harness 内部工具, 与本插件的 27 个 MCP 工具是两回事。', {}, async () => {
+  mcp.tool('harness_list_tools', '列出 Harness(宿主)自己注册的工具名清单。什么时候用: 想确认某个能力(如 bash/fs/web)在当前部署里是否可用, 或 agent_run 跑的 agent 抱怨没有某个工具时排查用的。返回一个字符串数组(纯名字, 无描述)。注意这是 Harness 内部工具, 与本插件的 28 个 MCP 工具是两回事。', {}, async () => {
     // [r6] 修: 旧实现读 ctx.tools.keys() —— 宿主 ToolRuntime 上**从来没有** keys() 方法
     // (dsh-tools 只有 register/get/schemas), 且旧代码用 `as unknown as` 屏蔽了类型检查,
     // 于是它长期静默返回 [], 而契约自检只校验 register 所以一直报绿。
@@ -4676,7 +4676,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   //   ③ 文件不存在 → 把内存事件快照写成 session.v4.jsonl.zstd 兼容格式
   //      (首行 {type:"session",...header} + 每事件一行 JSON, 单 zstd 帧)。
   // 注意: 本插件全部工具经 MCP SDK mcp.tool() 注册, 输出 schema 由 SDK 从 handler 返回值
-  // 自动生成 —— 与既有 27 个工具同一形态, 不受 DSH 宿主 ctx.tools 注册要求 output 声明的约束。
+  // 自动生成 —— 与既有 28 个工具同一形态, 不受 DSH 宿主 ctx.tools 注册要求 output 声明的约束。
   mcp.tool(
     'session_flush',
     '把一个会话的内容保障性写入磁盘(session.v4.jsonl.zstd)。什么时候用: ① agent_run/task_inbox 结束后想确认会话已持久化(崩溃/重启后还能 resume) ② session_stats 显示 persisted.fileExists:false 时补落盘 ③ 桥接创建的会话在 sessions 树里找不到文件时。行为: 文件已存在则不覆写(flushed:false, 宿主写句柄自管该文件); 不存在才把当前内存快照写出。返回 {sessionId,flushed,persisted:{fileExists,bytes,events,path?},reason?}。先看状态用 session_stats(带 persisted 字段)。',
@@ -4764,6 +4764,119 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         }))
       } catch (e) {
         return out(JSON.stringify({ error: toolFailure('session_flush', e) }))
+      }
+    },
+  )
+
+  // ── [W1.5] 工作区清单(workspace_list): 有哪些工作区、各挂了多少会话, 一步到位 ──
+  // 数据源: 官方注册表 ~/.dsh/storages/workspace.json(global.workspaceIds + tables.workspaces
+  // 的 path/title)为准; 会话归属与 session_list 同源(listCorpus), 按 header.cwd realpath 归一后
+  // **精确**比较(子目录工作区如 hermes-dsh-bridge 不会并入 10-projects)。cwd 不落在任何注册
+  // 工作区的会话归入 unregistered 分组(registered:false)。注册表文件读不到时回退
+  // ctx.workspaceRegistry.list()(无 title, title 退化为 basename)。
+  mcp.tool(
+    'workspace_list',
+    '一步列出所有已注册工作区及各自的会话数量(免去了 session_list 全量分页后按 cwd 手工分组推导)。什么时候用: ① 想知道这台机器上有哪些工作区、最近都在哪干活 ② 按工作区维度找会话(先拿 workspaceId/path, 再用 session_list(cwd=...) 精确列) ③ 发现存在 cwd 不属于任何注册工作区的"游离会话"(看 unregistered 组)。返回 {total,count,includeSessions,workspaces:[{workspaceId,path,title,sessionCount,registered,sessions?}]}, unregistered 组(registered:false)排在最后; includeSessions=true 时每组附 sessions(该工作区会话摘要 {id,title,messageCount}, 按 updatedAt 倒序, 每组最多 50 条, 会读事件流较慢)。',
+    {
+      includeSessions: z.boolean().optional().describe('是否附带每工作区的会话摘要数组(默认 false 只返回清单+计数, 快; true 会逐会话读事件流补 title/messageCount, 较慢)'),
+    },
+    async ({ includeSessions }) => {
+      try {
+        // ── ① 官方注册表(workspace.json) → {id, path, title} 清单 ──
+        interface WsRegEntry { id: string; path: string; title: string }
+        const reg: WsRegEntry[] = []
+        let registrySource: 'workspace.json' | 'workspaceRegistry' = 'workspace.json'
+        try {
+          const raw = JSON.parse(await readFile(joinPath(homedir(), '.dsh', 'storages', 'workspace.json'), 'utf8')) as {
+            global?: { workspaceIds?: readonly unknown[] }
+            tables?: { workspaces?: Record<string, { path?: unknown; title?: unknown }> }
+          }
+          const table = raw.tables?.workspaces ?? {}
+          for (const id of raw.global?.workspaceIds ?? []) {
+            if (typeof id !== 'string') continue
+            const w = table[id]
+            if (typeof w?.path !== 'string') continue
+            reg.push({ id, path: w.path, title: typeof w.title === 'string' && w.title ? w.title : basename(w.path) })
+          }
+        } catch { /* 注册表文件读不到 → 回退 ctx.workspaceRegistry */ }
+        if (reg.length === 0) {
+          registrySource = 'workspaceRegistry'
+          const registry = ctx.get('workspaceRegistry') as WorkspaceRegistryView | undefined
+          for (const ws of registry?.list?.() ?? []) reg.push({ id: ws.id, path: ws.path, title: basename(ws.path) })
+        }
+        // ── ② 会话语料(session_list 同源)按 cwd 归组(realpath 归一后精确比较) ──
+        const { rows: corpus } = await listCorpus(ctx)
+        const groups = new Map<string, CorpusRow[]>() // key = 归一化后的 cwd
+        const normCache = new Map<string, string>()
+        const normCwd = async (p: string): Promise<string> => {
+          let n = normCache.get(p)
+          if (n === undefined) { n = toPosixSep(await canonicalCwd(p)); normCache.set(p, n) }
+          return n
+        }
+        for (const r of corpus) {
+          if (r.header.cwd === undefined) continue
+          const n = await normCwd(r.header.cwd)
+          const arr = groups.get(n)
+          if (arr) arr.push(r)
+          else groups.set(n, [r])
+        }
+        // ── ③ 组装返回(reg 顺序; unregistered 垫底) ──
+        const WS_SESSIONS_MAX = 50
+        let skippedSessions = 0
+        const buildItem = async (entry: WsRegEntry, registered: boolean, rows: CorpusRow[]): Promise<Record<string, unknown>> => {
+          const sorted = rows.slice().sort((a, b) => b.updatedAt - a.updatedAt)
+          const item: Record<string, unknown> = {
+            workspaceId: entry.id,
+            path: entry.path,
+            title: entry.title,
+            sessionCount: sorted.length,
+            registered,
+          }
+          if (includeSessions === true) {
+            const selected = sorted.slice(0, WS_SESSIONS_MAX)
+            const detailById = await inspectRowsConcurrent(ctx, selected, () => { skippedSessions++ })
+            item.sessions = selected.map((r) => {
+              const d = detailById.get(String(r.header.id))
+              return {
+                id: r.header.id,
+                title: d?.title ?? `(untitled ${String(r.header.id).slice(0, 8)})`,
+                messageCount: d?.messageCount ?? null,
+                ...timeFields('updatedAt', r.updatedAt),
+              }
+            })
+            if (sorted.length > WS_SESSIONS_MAX) item.sessionsTruncated = true
+          }
+          return item
+        }
+        const items: Record<string, unknown>[] = []
+        for (const entry of reg) items.push(await buildItem(entry, true, groups.get(await normCwd(entry.path)) ?? []))
+        // unregistered: 有会话但 cwd 不在任何注册工作区的合并为一组返回
+        const regNorm = new Set<string>()
+        for (const entry of reg) regNorm.add(await normCwd(entry.path))
+        const unregRows: CorpusRow[] = []
+        for (const [n, rows] of groups) {
+          if (!regNorm.has(n)) unregRows.push(...rows)
+        }
+        if (unregRows.length > 0) {
+          const item = await buildItem(
+            { id: 'unregistered', path: '(unregistered)', title: '(unregistered: cwd 不在任何注册工作区)' },
+            false,
+            unregRows,
+          )
+          item.cwdList = [...new Set(unregRows.map((r) => r.header.cwd).filter((c): c is string => c !== undefined))]
+          items.push(item)
+        }
+        return out(JSON.stringify({
+          total: items.length,
+          count: items.length,
+          includeSessions: includeSessions === true,
+          source: registrySource,
+          ...(skippedSessions > 0 ? { skippedSessions } : {}),
+          workspaces: items,
+          next: '按工作区精确列会话用 session_list(cwd=<path>); 看某会话详情用 session_log(sessionId=...)',
+        }))
+      } catch (e) {
+        return out(JSON.stringify({ error: toolFailure('workspace_list', e) }))
       }
     },
   )
