@@ -600,11 +600,32 @@ async function fsAllowedRoots(ctx: Context): Promise<string[]> {
 }
 
 /**
+ * [W-fix1] 路径分隔符归一: Windows 的 realpath/readdir 返回反斜杠, 而旧代码用 `p.startsWith(root + '/')`
+ * 做前缀匹配 —— 反斜杠路径永远匹配不上正斜杠前缀, 导致 fs_stat/fs_read 对工作区内真实文件全灭
+ * (fs_list 之所以幸存, 是因为它常被传工作区根本身, 走的是 `canonical === r` 精确相等分支)。
+ * 统一转 '/' 后再比较, 两平台语义一致。
+ */
+function toPosixSep(p: string): string {
+  return p.replace(/\\/g, '/')
+}
+
+/**
+ * [W-fix1] 分隔符无关的"路径在根内"判定: 双侧归一 + 去尾分隔符后比较相等或前缀(带边界,
+ * 避免根 /a 误匹配 /ab)。大小写不敏感的 Windows 上由 realpath 双侧规范化保证一致, 此处不额外 lower-case。
+ */
+function isPathInside(child: string, root: string): boolean {
+  const c = toPosixSep(child)
+  const rTrimmed = toPosixSep(root).replace(/\/+$/, '')
+  return c === rTrimmed || c.startsWith(rTrimmed + '/')
+}
+
+/**
  * 敏感路径判定(对 realpath 规范化后的绝对路径逐段检查):
  * .ssh 目录及其内部 / .env 或 .env.* / 名字含 token / *.pem
+ * [W-fix1] 分段前先做分隔符归一 —— Windows 反斜杠路径用 '/' split 会整段失败, 敏感名全部漏检。
  */
 function isSensitivePath(canonical: string): boolean {
-  for (const seg of canonical.split('/')) {
+  for (const seg of toPosixSep(canonical).split('/')) {
     const s = seg.toLowerCase()
     if (!s) continue
     if (s === '.ssh') return true
@@ -627,7 +648,8 @@ async function gateFsPath(ctx: Context, rawPath: string): Promise<{ canonical?: 
   // 敏感名先拒: 即使落在白名单内也不允许读(.ssh/.env/*token*/*.pem)
   if (isSensitivePath(canonical)) return { error: `path denied by policy (sensitive name): ${rawPath}` }
   const roots = await fsAllowedRoots(ctx)
-  const allowed = roots.some((r) => canonical === r || canonical.startsWith(r + '/'))
+  // [W-fix1] 前缀匹配改用分隔符无关的 isPathInside(修 Windows 全灭)
+  const allowed = roots.some((r) => isPathInside(canonical, r))
   if (!allowed) return { error: `path outside allowed roots (~/.dsh + workspaces): ${canonical}` }
   return { canonical }
 }
@@ -644,7 +666,8 @@ async function gateFsPathSoft(ctx: Context, rawPath: string): Promise<{ canonica
   // 目标不存在 → 软判定: 仍按策略校验 resolve 结果, 通过则交回 missing 标记
   if (isSensitivePath(resolved)) return { error: `path denied by policy (sensitive name): ${rawPath}` }
   const roots = await fsAllowedRoots(ctx)
-  const allowed = roots.some((r) => resolved === r || resolved.startsWith(r + '/'))
+  // [W-fix1] 软准入同款修复(不存在的目标在 Windows 上同样撞前缀匹配)
+  const allowed = roots.some((r) => isPathInside(resolved, r))
   if (!allowed) return { error: `path outside allowed roots (~/.dsh + workspaces): ${resolved}` }
   return { canonical: resolved, missing: true }
 }
@@ -933,7 +956,8 @@ async function gateFsWritePath(rawPath: string): Promise<{ canonical?: string; e
   // 敏感名先拒(写比读更严: 即使在白名单内也拒绝)
   if (isSensitivePath(canonical)) return { error: `path denied by policy (sensitive name): ${rawPath}` }
   const roots = await Promise.all(runtimeConfig.workspaceRoots.map((r) => canonicalCwd(r)))
-  const allowed = roots.some((r) => canonical === r || canonical.startsWith(r + '/'))
+  // [W-fix1] fs_write jail 同款前缀修复
+  const allowed = roots.some((r) => isPathInside(canonical, r))
   if (!allowed) return { error: `path outside workspaceRoots (fs_write jail): ${canonical}` }
   return { canonical }
 }
@@ -1297,7 +1321,8 @@ async function executeTask(
   if (runtimeConfig.workspaceRoots.length > 0) {
     const allowed = runtimeConfig.workspaceRoots.some((root) => {
       const r = resolve(root)
-      return workdir === r || workdir.startsWith(r + '/')
+      // [W-fix1] cwd 白名单前缀匹配同款修复(Windows resolve 返回反斜杠)
+      return isPathInside(workdir, r)
     })
     if (!allowed) {
       throw new Error(`cwd not allowed (outside workspaceRoots): ${workdir}`)
