@@ -217,6 +217,24 @@ interface ProviderCheck {
  * 全程 try/catch: 探测本身任何异常都不得影响插件启动(与 contract.ts 同款哲学)。
  */
 declare function probeProviderDefault(ctx: Context): void;
+/**
+ * [W-fix1] 路径分隔符归一: Windows 的 realpath/readdir 返回反斜杠, 而旧代码用 `p.startsWith(root + '/')`
+ * 做前缀匹配 —— 反斜杠路径永远匹配不上正斜杠前缀, 导致 fs_stat/fs_read 对工作区内真实文件全灭
+ * (fs_list 之所以幸存, 是因为它常被传工作区根本身, 走的是 `canonical === r` 精确相等分支)。
+ * 统一转 '/' 后再比较, 两平台语义一致。
+ */
+declare function toPosixSep(p: string): string;
+/**
+ * [W-fix1] 分隔符无关的"路径在根内"判定: 双侧归一 + 去尾分隔符后比较相等或前缀(带边界,
+ * 避免根 /a 误匹配 /ab)。大小写不敏感的 Windows 上由 realpath 双侧规范化保证一致, 此处不额外 lower-case。
+ */
+declare function isPathInside(child: string, root: string): boolean;
+/**
+ * 敏感路径判定(对 realpath 规范化后的绝对路径逐段检查):
+ * .ssh 目录及其内部 / .env 或 .env.* / 名字含 token / *.pem
+ * [W-fix1] 分段前先做分隔符归一 —— Windows 反斜杠路径用 '/' split 会整段失败, 敏感名全部漏检。
+ */
+declare function isSensitivePath(canonical: string): boolean;
 /** [r2] A: 会话类错误的统一后缀(下一步动作) */
 /** [r3] C7: 会话不存在 —— 走统一句式 `<错误>: <关键值> (<原因>; <下一步>)` */
 /** [R7 P2-1]: 可选 `next` 覆盖 —— 供调用方把**附加说明**并进 next 参数, 而不是外挂拼接破坏句式 */
@@ -525,10 +543,13 @@ interface CorpusRow {
     sizeBytes?: number;
 }
 /** [r1] 项目目录名编码: header.cwd → 物理目录名。
- *  实测本机布局为 `--<cwd 去前导 / 且 / → ->--`, 且 '@' 会被编码成 '~0040'
+ *  实测布局为 `--<cwd 去前导分隔符且分隔符 → ->--`, 且 '@' 会被编码成 '~0040'
  *  (例: /root/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server
- *   → --root-.dsh-profiles-web-node_modules-~0040chushixixin-dsh-harness-mcp-server--)。
- *  这是宿主私有布局的 best-effort 推导: 推错只会让该行退回 createdAt, 不影响正确性。 */
+ *   → --root-.dsh-profiles-web-node_modules-~0040chushixixin-dsh-harness-mcp-server--;
+ *   Windows: C:\Users\x\Documents\w → --C-Users-x-Documents-w--, 盘符冒号随分隔符一起折叠成单个 '-')。
+ *  这是宿主私有布局的 best-effort 推导: 推错只会让该行退回 createdAt, 不影响正确性。
+ *  [W-fix2] 原实现只吃 POSIX 路径(前导 / 剥离 + / 替换), Windows 的反斜杠与盘符冒号全部失配;
+ *  改为跨平台: 任意分隔符(含紧跟的冒号)折叠为 '-', 前后导分隔符剥除。 */
 declare function projectDirNameOf(cwd: string): string | undefined;
 /**
  * [r1] A2: 整批取"盘上真实 mtime"(绝不调用 persistence.stat() —— 那是 O(树) 的, 实测 47~60ms/次)。
@@ -569,6 +590,38 @@ interface PendingApproval {
     /** 超时定时器(approvalTimeoutMs 后收尾, 绝不超时放行) */
     timer?: ReturnType<typeof setTimeout>;
 }
+/**
+ * 解压 dsh 落盘的 session.jsonl.zstd: 多个 zstd 帧顺序拼接(每次 flush 追加一帧),
+ * 整文件单次 sync 解压只能拿到首帧。按魔数切分逐帧解压; 魔数若误现于帧载荷内,
+ * 向后合并相邻分段直到解压成功(合并到文件尾仍失败则该帧损坏, 跳过)。
+ */
+declare function decompressZstdFile(buf: Buffer): string;
+/** 会话落盘根: DSH_SESSIONS_DIR 显式覆盖, 缺省 ~/.dsh/sessions */
+declare function sessionsDiskRoot(): string;
+/** [W-fix2] 在一个会话目录里挑落盘文件: 版本号最高优先, 平级取 mtime 最新。找不到返回 undefined。 */
+declare function pickSessionFile(sessionDir: string): Promise<{
+    name: string;
+    path: string;
+    version: number;
+    mtimeMs: number;
+    sizeBytes: number;
+} | undefined>;
+/** [W-fix2] 解析会话落盘文件 → { header, events }: 首行 type:"session" 是 header 记录, 其余为事件流 */
+declare function parseSessionFileText(text: string): {
+    header?: SessionHeader;
+    events: unknown[];
+};
+/**
+ * [W-fix2] 磁盘兜底读会话: 先试 header.cwd 推导的项目目录(O(1)), 再扫全树项目目录找
+ * 名字含 <id> 的会话目录。返回 undefined 表示盘上确实没有。
+ */
+declare function readSessionFromDisk(sessionId: string, headerHint?: SessionHeader): Promise<{
+    header: SessionHeader;
+    events: unknown[];
+    path: string;
+    bytes: number;
+    version: number;
+} | undefined>;
 /** session_search 结果行 */
 interface SessionSearchRow {
     sessionId: string;
@@ -667,6 +720,14 @@ export declare const __internals: {
     noiseKey: typeof noiseKey;
     NOISE_MIN_SAMPLE: number;
     NOISE_MIN_RATIO: number;
+    toPosixSep: typeof toPosixSep;
+    isPathInside: typeof isPathInside;
+    isSensitivePath: typeof isSensitivePath;
+    readSessionFromDisk: typeof readSessionFromDisk;
+    pickSessionFile: typeof pickSessionFile;
+    parseSessionFileText: typeof parseSessionFileText;
+    decompressZstdFile: typeof decompressZstdFile;
+    sessionsDiskRoot: typeof sessionsDiskRoot;
     VERSION: string;
 };
 export {};

@@ -82,12 +82,16 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { randomUUID } from 'node:crypto'
 // [P0 回调] HMAC 签名与恒时比较(防伪造/防时序侧信道)
 import { createHmac, timingSafeEqual } from 'node:crypto'
-import { readdir, readFile, realpath, stat, writeFile, appendFile, mkdir, unlink } from 'node:fs/promises'
+import { readdir, readFile, realpath, stat, writeFile, appendFile, mkdir, unlink, rename } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 // [P0 回调] X-DSH-Timestamp 取值(签名材料与重放窗口判定共用同一时钟源)
 import { performance } from 'node:perf_hooks'
 import { zstdDecompressSync } from 'node:zlib'
+// [W-fix3] 落盘兜底写 session.v4.jsonl.zstd 需要 zstd 压缩。Node 22.15+/24 提供 zstdCompressSync,
+// 但 @types/node ~22 的类型可能没有它 —— 用 namespace 导入 + 运行时探测, 编译期不依赖其类型声明。
+import * as zlibModule from 'node:zlib'
+const zstdCompressSyncMaybe: ((buf: Buffer) => Buffer) | undefined = (zlibModule as { zstdCompressSync?: (buf: Buffer) => Buffer }).zstdCompressSync
 import { homedir } from 'node:os'
 import { join as joinPath, resolve, dirname, basename } from 'node:path'
 
@@ -693,7 +697,7 @@ function defaultCwdHint(): string {
 
 /**
  * [r2] A/B: 统一的"下一步怎么办"提示片段 —— 让每个错误/结果都能自解释, agent 不用猜链路。
- * 抽成常量便于 26 个工具的描述与错误文案保持措辞一致。
+ * 抽成常量便于 27 个工具的描述与错误文案保持措辞一致。
  */
 const HINT = {
   /** 拿到 taskId 之后干什么 */
@@ -720,7 +724,7 @@ function taskNotFoundError(taskId: string): string {
 
 // ═══════════════════ [r3] A: 输出精简/格式化 + C: 错误文案与参数预校验 ═══════════════════
 //
-// R2 已把 26 个工具描述写成"面向 agent"; R3 处理 agent 真正拿到的返回体与错误串:
+// R2 已把 27 个工具描述写成"面向 agent"; R3 处理 agent 真正拿到的返回体与错误串:
 //   A: 时间戳统一 ISO8601(本地时区) + *_at_epoch 保留原始 epoch; 字节/时长带人类可读单位;
 //      列表类返回分页(offset/limit)+ total/truncated; session_log 默认限 50 条并给 truncated 取更多提示。
 //   C: 三类错误(必传参数缺失 / id 不存在 / 会话为空)统一为
@@ -900,7 +904,7 @@ function pageEnvelope<T>(rows: readonly T[], offset: number, limit: number, tool
   }
 }
 
-/** [r3] A: 分页参数 schema(列表类工具共用, 保证 26 个工具的分页口径一致) */
+/** [r3] A: 分页参数 schema(列表类工具共用, 保证 27 个工具的分页口径一致) */
 const pageArgSchema = {
   offset: z.number().int().min(0).optional().describe('跳过前 N 条(默认 0; 配合 limit 翻页)'),
   limit: z.number().int().min(1).max(LIST_PAGE_MAX).optional().describe(`本页最多返回条数(默认 ${LIST_PAGE_DEFAULT}, 最大 ${LIST_PAGE_MAX})`),
@@ -4028,7 +4032,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     return out(JSON.stringify({ 收到: text, ...timeFields('at', now) }))
   })
 
-  mcp.tool('harness_list_tools', '列出 Harness(宿主)自己注册的工具名清单。什么时候用: 想确认某个能力(如 bash/fs/web)在当前部署里是否可用, 或 agent_run 跑的 agent 抱怨没有某个工具时排查用的。返回一个字符串数组(纯名字, 无描述)。注意这是 Harness 内部工具, 与本插件的 26 个 MCP 工具是两回事。', {}, async () => {
+  mcp.tool('harness_list_tools', '列出 Harness(宿主)自己注册的工具名清单。什么时候用: 想确认某个能力(如 bash/fs/web)在当前部署里是否可用, 或 agent_run 跑的 agent 抱怨没有某个工具时排查用的。返回一个字符串数组(纯名字, 无描述)。注意这是 Harness 内部工具, 与本插件的 27 个 MCP 工具是两回事。', {}, async () => {
     // [r6] 修: 旧实现读 ctx.tools.keys() —— 宿主 ToolRuntime 上**从来没有** keys() 方法
     // (dsh-tools 只有 register/get/schemas), 且旧代码用 `as unknown as` 屏蔽了类型检查,
     // 于是它长期静默返回 [], 而契约自检只校验 register 所以一直报绿。
@@ -4618,7 +4622,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P1: 会话统计(session_stats) ──
   mcp.tool(
     'session_stats',
-    '看一个会话的用量与性能统计(不读内容, 只看数)。什么时候用: ① 想知道刚才那次 agent_run 花了多少 token / 多久 ② 对比不同 preset 或不同任务的效率 ③ 排查"怎么这么慢"(看 ttft/toolTime/cacheHitRate 哪块占大头)。不传 sessionId = 最近一次 agent_run/task_inbox 的会话(最常用); 传 sessionId = 指定会话的全会话累计。返回 {rounds,steps,llmTime,toolTime,ttft,tokensPerSec,cacheHitRate,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,source}(时间是秒)。想看具体发生了什么用 session_log。',
+    '看一个会话的用量与性能统计(不读内容, 只看数)。什么时候用: ① 想知道刚才那次 agent_run 花了多少 token / 多久 ② 对比不同 preset 或不同任务的效率 ③ 排查"怎么这么慢"(看 ttft/toolTime/cacheHitRate 哪块占大头) ④ 确认会话是否已落盘(看 persisted.fileExists)。不传 sessionId = 最近一次 agent_run/task_inbox 的会话(最常用); 传 sessionId = 指定会话的全会话累计。返回 {rounds,steps,llmTime,toolTime,ttft,tokensPerSec,cacheHitRate,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,persisted:{fileExists,bytes?,events?,path?},source}(时间是秒; persisted.events 是盘上文件里的真实事件数, 可能略落后于内存)。想看具体发生了什么用 session_log; 想把还没落盘的会话补写盘用 session_flush。',
     { sessionId: z.string().optional().describe('会话 id(缺省 = 最近一次 agent_run/task_inbox 的会话; 也可传 session_list 里的任意 id)') },
     async ({ sessionId }) => {
       try {
@@ -4643,10 +4647,123 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           return out(JSON.stringify({ error: emptySessionError(target) }))
         }
         source = found.source
+        // [W-fix3-1] 落盘保障可见性: persisted {fileExists, bytes, events} —— 文件在不在/多大/盘上事件数。
+        // 读法: 优先官方 locate(header) 路径, 拼不中(KNOWN_ISSUES 🅰️)则按 id 磁盘兜底扫描。
+        let persisted: Record<string, unknown> | undefined
+        try {
+          const onDisk = await readSessionFromDisk(target)
+          if (onDisk) {
+            persisted = { fileExists: true, bytes: onDisk.bytes, events: onDisk.events.length, path: onDisk.path }
+          } else {
+            persisted = { fileExists: false }
+          }
+        } catch { /* 落盘探测失败不阻断统计本体 */ }
         const stats = presentSessionStats(foldSessionStats(found.events), { scope: 'session', sessionId: target })
-        return out(JSON.stringify({ ...stats, source, next: HINT.resumeSession }, null, 2))
+        return out(JSON.stringify({ ...stats, source, ...(persisted !== undefined ? { persisted } : {}), next: HINT.resumeSession }, null, 2))
       } catch (e) {
         return out(JSON.stringify({ error: toolFailure('session_stats', e) }))
+      }
+    },
+  )
+
+  // ── [W-fix3-2] 会话落盘保障(session_flush) ──
+  // 调研结论(2026-10-27, 对宿主 app.asar 字符串级探查): ctx.sessionPersistence 服务面只有
+  // list/stat/open/locate/create, **没有公开的 flush/sync API**(agent-loop 内部的写句柄
+  // 由宿主自管, 插件够不着)。故实现为三级:
+  //   ① 探测式调用: 若未来宿主暴露 persistence.flush/flushNow, 优先走官方;
+  //   ② 文件已在盘上 → 不动它(宿主写句柄可能正持有该文件, 外部覆写会破坏其 append 语义),
+  //      如实返回 already persisted;
+  //   ③ 文件不存在 → 把内存事件快照写成 session.v4.jsonl.zstd 兼容格式
+  //      (首行 {type:"session",...header} + 每事件一行 JSON, 单 zstd 帧)。
+  // 注意: 本插件全部工具经 MCP SDK mcp.tool() 注册, 输出 schema 由 SDK 从 handler 返回值
+  // 自动生成 —— 与既有 27 个工具同一形态, 不受 DSH 宿主 ctx.tools 注册要求 output 声明的约束。
+  mcp.tool(
+    'session_flush',
+    '把一个会话的内容保障性写入磁盘(session.v4.jsonl.zstd)。什么时候用: ① agent_run/task_inbox 结束后想确认会话已持久化(崩溃/重启后还能 resume) ② session_stats 显示 persisted.fileExists:false 时补落盘 ③ 桥接创建的会话在 sessions 树里找不到文件时。行为: 文件已存在则不覆写(flushed:false, 宿主写句柄自管该文件); 不存在才把当前内存快照写出。返回 {sessionId,flushed,persisted:{fileExists,bytes,events,path?},reason?}。先看状态用 session_stats(带 persisted 字段)。',
+    { sessionId: z.string().describe('会话 id(session_list 的 sessions[].id 或 agent_run 结果里的 sessionId)') },
+    async ({ sessionId }) => {
+      try {
+        const bad = validateArgs('session_flush', { sessionId }, [{ name: 'sessionId', type: 'string', required: true }])
+        if (bad) return out(JSON.stringify({ error: bad }))
+        const sid = SessionId(sessionId)
+        // ── 收集会话: live → persistedInspect → 磁盘(顺序与 session_log 一致) ──
+        let meta: SessionHeader | undefined
+        let events: unknown[] = []
+        const store = ctx.get('sessions') as SessionsStoreView | undefined
+        const live = store?.get?.(sid) as { header?: SessionHeader; log?: unknown[] } | undefined
+        if (live) {
+          meta = live.header
+          events = live.log ?? []
+        }
+        if (events.length === 0 || meta === undefined) {
+          try {
+            const insp = await persistedInspect(ctx, sid)
+            if (insp) {
+              meta = insp.meta
+              if (events.length === 0) events = insp.events
+            }
+          } catch { /* → 磁盘兜底 */ }
+        }
+        if (meta === undefined) {
+          const onDisk = await readSessionFromDisk(sessionId)
+          if (onDisk) { meta = onDisk.header; events = onDisk.events }
+        }
+        if (meta === undefined) return out(JSON.stringify({ error: sessionNotFoundError(sessionId) }))
+        // ── ① 官方 flush 探测(未来宿主若暴露则优先) ──
+        const persistence = ctx.get('sessionPersistence') as
+          | (PersistenceView & { flush?: (id: SessionId) => Promise<unknown>; flushNow?: (id: SessionId) => Promise<unknown> })
+          | undefined
+        for (const official of [persistence?.flush, persistence?.flushNow]) {
+          if (typeof official === 'function') {
+            try {
+              await official.call(persistence, sid)
+            } catch { /* 官方 flush 失败 → 继续走文件判定 */ }
+            break
+          }
+        }
+        // ── ② 文件已在盘上: 绝不覆写(宿主写句柄可能正持有), 如实上报 ──
+        const onDisk = await readSessionFromDisk(sessionId, meta)
+        if (onDisk) {
+          return out(JSON.stringify({
+            sessionId,
+            flushed: false,
+            persisted: { fileExists: true, bytes: onDisk.bytes, events: onDisk.events.length, path: onDisk.path },
+            reason: '落盘文件已存在(宿主写句柄自管, 不覆写); 若需最新内容等会话结束或再跑一轮后重试',
+          }))
+        }
+        // ── ③ 自写: eventsSnapshot → session.v4.jsonl.zstd ──
+        if (meta.cwd === undefined) {
+          return out(JSON.stringify({ error: errText('cannot flush', sessionId, '会话 header 缺 cwd, 推不出落盘项目目录', '先用 session_log(sessionId=...) 查看 header; 该会话可能未正常初始化') }))
+        }
+        const dirName = projectDirNameOf(meta.cwd)
+        if (dirName === undefined) {
+          return out(JSON.stringify({ error: errText('cannot flush', sessionId, `cwd 无法编码为项目目录名: ${meta.cwd}`, '确认 session_log 返回的 header.cwd 是否合法路径') }))
+        }
+        if (typeof zstdCompressSyncMaybe !== 'function') {
+          return out(JSON.stringify({ error: errText('cannot flush', sessionId, `当前 Node(${process.version}) 无 zstdCompressSync, 无法写出 zstd 落盘文件`, '升级宿主 Node 至 22.15+/24+, 或改用 fs_write 手工备份事件') }))
+        }
+        const headerRecord = { type: 'session', version: 4, ...(meta as unknown as Record<string, unknown>) }
+        const jsonl = [JSON.stringify(headerRecord), ...events.map((e) => JSON.stringify(e))].join('\n') + '\n'
+        const targetDir = joinPath(sessionsDiskRoot(), dirName, String(meta.id ?? sessionId))
+        const targetPath = joinPath(targetDir, 'session.v4.jsonl.zstd')
+        try {
+          await mkdir(targetDir, { recursive: true })
+          // 原子落位: 先写临时文件再 rename, 半截写不会被当成合法落盘
+          const tmpPath = joinPath(targetDir, `.flush-tmp-${Date.now()}-${process.pid}`)
+          await writeFile(tmpPath, zstdCompressSyncMaybe(Buffer.from(jsonl, 'utf8')))
+          await rename(tmpPath, targetPath)
+        } catch (e) {
+          return out(JSON.stringify({ error: errText('flush failed', targetPath, `写出落盘文件失败: ${(e as Error)?.message ?? String(e)}`, '确认磁盘可写/路径无占用后重试') }))
+        }
+        const st = await stat(targetPath)
+        return out(JSON.stringify({
+          sessionId,
+          flushed: true,
+          persisted: { fileExists: true, bytes: st.size, events: events.length, path: targetPath },
+          note: '已把内存事件快照写为 session.v4.jsonl.zstd 兼容格式(首行 session header + 逐事件 JSONL, 单 zstd 帧); 验证可用 session_log(sessionId=...) 或 session_stats 看 persisted',
+        }))
+      } catch (e) {
+        return out(JSON.stringify({ error: toolFailure('session_flush', e) }))
       }
     },
   )
@@ -5927,5 +6044,8 @@ export const __internals = {
   set approvalBridgeFilesForTest(v) { approvalBridgeFiles = v },
   // [R9 P3] 样板文字统计过滤纯函数(供单测直接断言判定规则, 不依赖真实会话内容)
   detectBoilerplateKeys, noiseKey, NOISE_MIN_SAMPLE, NOISE_MIN_RATIO,
+  // [W-fix] Windows 路径修复 + 会话磁盘兜底: 供单测直接断言(分隔符归一/根内判定/落盘扫描/解析)
+  toPosixSep, isPathInside, isSensitivePath,
+  readSessionFromDisk, pickSessionFile, parseSessionFileText, decompressZstdFile, sessionsDiskRoot,
   VERSION: PLUGIN_VERSION,
 }
