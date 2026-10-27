@@ -2366,15 +2366,19 @@ interface CorpusRow {
 }
 
 /** [r1] 项目目录名编码: header.cwd → 物理目录名。
- *  实测本机布局为 `--<cwd 去前导 / 且 / → ->--`, 且 '@' 会被编码成 '~0040'
+ *  实测布局为 `--<cwd 去前导分隔符且分隔符 → ->--`, 且 '@' 会被编码成 '~0040'
  *  (例: /root/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server
- *   → --root-.dsh-profiles-web-node_modules-~0040chushixixin-dsh-harness-mcp-server--)。
- *  这是宿主私有布局的 best-effort 推导: 推错只会让该行退回 createdAt, 不影响正确性。 */
+ *   → --root-.dsh-profiles-web-node_modules-~0040chushixixin-dsh-harness-mcp-server--;
+ *   Windows: C:\Users\x\Documents\w → --C-Users-x-Documents-w--, 盘符冒号随分隔符一起折叠成单个 '-')。
+ *  这是宿主私有布局的 best-effort 推导: 推错只会让该行退回 createdAt, 不影响正确性。
+ *  [W-fix2] 原实现只吃 POSIX 路径(前导 / 剥离 + / 替换), Windows 的反斜杠与盘符冒号全部失配;
+ *  改为跨平台: 任意分隔符(含紧跟的冒号)折叠为 '-', 前后导分隔符剥除。 */
 function projectDirNameOf(cwd: string): string | undefined {
   try {
-    const trimmed = cwd.replace(/^\/+/, '').replace(/\/+$/, '')
-    if (!trimmed) return undefined
-    return '--' + trimmed.replace(/\//g, '-').replace(/@/g, '~0040') + '--'
+    const trimmed = cwd.replace(/^[/\\]+/, '').replace(/[/\\]+$/, '')
+    const body = trimmed.replace(/:?[\\/]+/g, '-').replace(/@/g, '~0040')
+    if (!body) return undefined
+    return '--' + body + '--'
   } catch {
     return undefined
   }
@@ -3476,6 +3480,111 @@ function decompressZstdFile(buf: Buffer): string {
   return text
 }
 
+// ═══════════════════════ [W-fix2] 会话落盘文件磁盘兜底(session_log/session_stats/session_flush 共用) ═══════════════════════
+//
+// 背景: 上游 locate() 恒按**当前**格式版本拼文件名(KNOWN_ISSUES 🅰️, 本机 93% 路径不存在),
+// 加上 Windows 的 cwd 目录编码差异, persistedInspect(open/read) 与 locate 双双落空时,
+// session_log 直接报 "session not found" —— 但文件明明躺在盘上。
+// 修法与作者为 mtime 做的三级策略同思路: 不依赖 locate(), 按 sessionId 在 sessions 树里
+// 直接找会话目录(*<id>*), 接受任何 session.v*.jsonl.zstd 及 legacy session.jsonl.zstd, 解压解析。
+
+/** 会话落盘根: DSH_SESSIONS_DIR 显式覆盖, 缺省 ~/.dsh/sessions */
+function sessionsDiskRoot(): string {
+  return process.env.DSH_SESSIONS_DIR || joinPath(homedir(), '.dsh', 'sessions')
+}
+
+/** 会话日志文件命名: session.v4.jsonl.zstd / session.v3.jsonl / legacy session.jsonl.zstd 等 */
+const SESSION_FILE_RE = /^session(?:\.v(\d+))?\.jsonl(?:\.zstd)?$/
+
+/** [W-fix2] 在一个会话目录里挑落盘文件: 版本号最高优先, 平级取 mtime 最新。找不到返回 undefined。 */
+async function pickSessionFile(sessionDir: string): Promise<{ name: string; path: string; version: number; mtimeMs: number; sizeBytes: number } | undefined> {
+  let names: string[]
+  try {
+    names = await readdir(sessionDir)
+  } catch {
+    return undefined
+  }
+  let best: { name: string; path: string; version: number; mtimeMs: number; sizeBytes: number } | undefined
+  for (const name of names) {
+    const m = SESSION_FILE_RE.exec(name)
+    if (!m) continue
+    const version = m[1] !== undefined ? Number(m[1]) : 0
+    const full = joinPath(sessionDir, name)
+    try {
+      const st = await stat(full)
+      if (!st.isFile()) continue
+      const cand = { name, path: full, version, mtimeMs: st.mtimeMs, sizeBytes: st.size }
+      if (best === undefined || cand.version > best.version || (cand.version === best.version && cand.mtimeMs > best.mtimeMs)) best = cand
+    } catch { /* 单文件失败跳过 */ }
+  }
+  return best
+}
+
+/** [W-fix2] 解析会话落盘文件 → { header, events }: 首行 type:"session" 是 header 记录, 其余为事件流 */
+function parseSessionFileText(text: string): { header?: SessionHeader; events: unknown[] } {
+  const events: unknown[] = []
+  let header: SessionHeader | undefined
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue
+    try {
+      const rec = JSON.parse(line) as { type?: string }
+      if (rec?.type === 'session' && header === undefined) {
+        header = rec as SessionHeader
+        continue
+      }
+      events.push(rec)
+    } catch { /* 坏行跳过 */ }
+  }
+  return { header, events }
+}
+
+/**
+ * [W-fix2] 磁盘兜底读会话: 先试 header.cwd 推导的项目目录(O(1)), 再扫全树项目目录找
+ * 名字含 <id> 的会话目录。返回 undefined 表示盘上确实没有。
+ */
+async function readSessionFromDisk(
+  sessionId: string,
+  headerHint?: SessionHeader,
+): Promise<{ header: SessionHeader; events: unknown[]; path: string; bytes: number; version: number } | undefined> {
+  const root = sessionsDiskRoot()
+  const id = String(sessionId)
+  // 候选目录: cwd 推导命中优先(O(1)); 其余扫项目目录下的会话子目录(名字含 <id>, 含 legacy 变体)
+  const candidates: string[] = []
+  const derived = headerHint?.cwd !== undefined ? projectDirNameOf(headerHint.cwd) : undefined
+  if (derived !== undefined) candidates.push(joinPath(root, derived, id))
+  try {
+    for (const proj of await readdir(root, { withFileTypes: true })) {
+      if (!proj.isDirectory()) continue
+      const projDir = joinPath(root, proj.name)
+      try {
+        for (const child of await readdir(projDir, { withFileTypes: true })) {
+          if (!child.isDirectory() || !child.name.includes(id)) continue
+          const p = joinPath(projDir, child.name)
+          if (!candidates.includes(p)) candidates.push(p)
+        }
+      } catch { /* 读不了就跳过 */ }
+    }
+  } catch { /* sessions 根不可读 → 只剩推导目录 */ }
+  for (const dir of candidates) {
+    const picked = await pickSessionFile(dir)
+    if (picked === undefined) continue
+    try {
+      const buf = await readFile(picked.path)
+      const text = picked.name.endsWith('.zstd') ? decompressZstdFile(buf) : buf.toString('utf8')
+      const parsed = parseSessionFileText(text)
+      if (parsed.header === undefined && parsed.events.length === 0) continue
+      return {
+        header: parsed.header ?? headerHint as SessionHeader,
+        events: parsed.events,
+        path: picked.path,
+        bytes: picked.sizeBytes,
+        version: picked.version,
+      }
+    } catch { /* 解压/解析失败 → 试下一个候选 */ }
+  }
+  return undefined
+}
+
 /** Promise 限时: 超时返回 undefined(不中断原 promise, 只是不再等它) */
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -3521,6 +3630,11 @@ async function readSessionEventsSearch(ctx: Context, header: SessionHeader): Pro
       }
     } catch { /* 读不到/解压失败 → 放弃该会话内容搜索 */ }
   }
+  // [W-fix2] locate() 拼不中路径时, 磁盘兜底按 id 找会话目录直接读文件
+  try {
+    const onDisk = await readSessionFromDisk(String(header.id), header)
+    if (onDisk && onDisk.events.length > 0) return { events: onDisk.events, source: 'file' }
+  } catch { /* 兜底也失败 → 放弃 */ }
   return undefined
 }
 
@@ -3804,10 +3918,11 @@ async function searchOneSession(
 let lastAgentSessionId: string | undefined
 
 /**
- * 收集一个会话的完整事件流([r2] persistedInspect 优先: 0.1.2 inspect / 0.1.5 open+read, 回退 live store 日志)。
- * 返回 undefined 表示 live 与持久化里都没有该会话。
+ * 收集一个会话的完整事件流([r2] persistedInspect 优先: 0.1.2 inspect / 0.1.5 open+read, 回退 live store 日志,
+ * 最后落盘文件磁盘兜底[W-fix2] —— 上游 locate() 93% 拼不中路径时仍能读到盘上会话)。
+ * 返回 undefined 表示 live/持久化/磁盘三路都没有该会话。
  */
-async function collectSessionEvents(ctx: Context, sid: SessionId): Promise<{ events: unknown[]; source: 'persisted' | 'live' } | undefined> {
+async function collectSessionEvents(ctx: Context, sid: SessionId): Promise<{ events: unknown[]; source: 'persisted' | 'live' | 'file' } | undefined> {
   try {
     const insp = await persistedInspect(ctx, sid)
     if (insp && insp.events.length > 0) return { events: insp.events, source: 'persisted' }
@@ -3820,6 +3935,9 @@ async function collectSessionEvents(ctx: Context, sid: SessionId): Promise<{ eve
     const insp = await persistedInspect(ctx, sid)
     if (insp) return { events: [], source: 'persisted' }
   } catch { /* ignore */ }
+  // [W-fix2] 磁盘兜底: 文件在盘上但 locate()/open() 都够不着(上游 KNOWN_ISSUES 🅰️)
+  const onDisk = await readSessionFromDisk(String(sid))
+  if (onDisk && onDisk.events.length > 0) return { events: onDisk.events, source: 'file' }
   return undefined
 }
 
@@ -4419,6 +4537,15 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           if (live) {
             meta = live.header ?? meta
             events = live.log ?? []
+          }
+        }
+        // [W-fix2] 磁盘兜底: persistedInspect/live 都落空(上游 locate() 恒按当前版本拼路径,
+        // KNOWN_ISSUES 🅰️), 但文件明明在盘上 —— 按 id 扫 sessions 树解压解析。
+        if (meta === undefined && events.length === 0) {
+          const onDisk = await readSessionFromDisk(sessionId)
+          if (onDisk) {
+            meta = onDisk.header
+            events = onDisk.events
           }
         }
         if (meta === undefined && events.length === 0) {
